@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+
+# Private conversations and local model artifacts
+private-chats/
+*.chat.txt
+*_chat_export.txt
+*.gguf
+*.safetensors
+models/
+
+# Build and editor artifacts
+build/
+dist/
+coverage/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
