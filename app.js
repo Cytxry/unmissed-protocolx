@@ -227,9 +227,13 @@ function statPill(label, value) {
 function renderDashboard(job) {
   const messages = job.messages || [];
   const findings = job.findings || [];
+  const coverage = job.coverage || null;
   $('summary-text').textContent = maskPhoneNumbers(job.summary || 'The local model did not return a concise summary for this conversation.');
   $('result-model').textContent = maskPhoneNumbers(job.model || '');
-  $('result-count').textContent = `${messages.length} messages · ${findings.length} findings`;
+  const coverageLabel = coverage && !coverage.analysisComplete
+    ? ` · Partial analysis (${coverage.analyzedChunks}/${coverage.totalChunks} sections)`
+    : coverage && !coverage.synthesisComplete ? ' · Cross-section synthesis incomplete' : '';
+  $('result-count').textContent = `${messages.length} messages · ${findings.length} findings${coverageLabel}`;
   $('message-count').textContent = `${messages.length} messages`;
   $('analysis-disclosure').textContent = maskPhoneNumbers(`${job.model} · Local Ollama analysis · ${job.chunks} ${job.chunks === 1 ? 'chunk' : 'chunks'}`);
 

@@ -178,6 +178,81 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertEqual(len(result["findings"]), 1)
         self.assertEqual(set(result["findings"][0]["evidence"]), {message["id"] for message in result["messages"]})
 
+    def test_run_job_keeps_successful_chunks_and_marks_coverage_when_a_chunk_fails(self):
+        raw = "\n".join(f"Person{index}: " + (f"context-{index} " * 10) for index in range(1, 9))
+        job_id = "pipeline-partial-test"
+        calls = 0
+
+        def chunk_analysis(_model, chunk, _user_name):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise UserError("Ollama timed out")
+            message = chunk[0]
+            return {"summary": f"Section {calls} summary.", "findings": [{
+                "category": "other_update", "title": f"Update from {message['id']}",
+                "detail": "A supported update.", "owner": "", "due": "", "when": "",
+                "confidence": "medium", "evidence": [message["id"]], "conflictEvidence": [],
+            }]}
+
+        initial_job = {"state": "queued", "stage": "queued", "completed": 0, "total": 0, "message": "queued"}
+        with (patch.dict(app.JOBS, {job_id: initial_job}),
+              patch("app.CHUNK_CHARS", 400),
+              patch("app.analyze_dashboard_chunk", side_effect=chunk_analysis),
+              patch("app.synthesize_dashboard") as synthesize):
+            app.run_job(job_id, raw, "test-model")
+            result = app.JOBS[job_id]
+
+        self.assertGreater(result["coverage"]["totalChunks"], 2)
+        self.assertEqual(result["state"], "done")
+        self.assertFalse(result["coverage"]["analysisComplete"])
+        self.assertFalse(result["coverage"]["synthesisComplete"])
+        self.assertEqual(result["coverage"]["failedChunks"], [2])
+        self.assertEqual(result["coverage"]["analyzedChunks"], result["coverage"]["totalChunks"] - 1)
+        self.assertTrue(result["findings"])
+        valid_ids = {message["id"] for message in result["messages"]}
+        self.assertTrue(all(set(item["evidence"]).issubset(valid_ids) for item in result["findings"]))
+        self.assertTrue(any("results cover" in warning for warning in result["warnings"]))
+        synthesize.assert_not_called()
+        self.assertEqual(result["completed"], result["total"])
+
+    def test_run_job_keeps_findings_when_cross_section_synthesis_crashes(self):
+        raw = "\n".join(f"Person{index}: " + (f"context-{index} " * 10) for index in range(1, 9))
+        job_id = "pipeline-synthesis-failure-test"
+
+        def chunk_analysis(_model, chunk, _user_name):
+            message = chunk[0]
+            return {"summary": f"Section for {message['id']}.", "findings": [{
+                "category": "other_update", "title": f"Update from {message['id']}",
+                "detail": "A supported update.", "owner": "", "due": "", "when": "",
+                "confidence": "medium", "evidence": [message["id"]], "conflictEvidence": [],
+            }]}
+
+        initial_job = {"state": "queued", "stage": "queued", "completed": 0, "total": 0, "message": "queued"}
+        with (patch.dict(app.JOBS, {job_id: initial_job}),
+              patch("app.CHUNK_CHARS", 400),
+              patch("app.analyze_dashboard_chunk", side_effect=chunk_analysis),
+              patch("app.synthesize_dashboard", side_effect=RuntimeError("internal synthesis error"))):
+            app.run_job(job_id, raw, "test-model")
+            result = app.JOBS[job_id]
+
+        self.assertEqual(result["state"], "done")
+        self.assertTrue(result["findings"])
+        self.assertTrue(result["coverage"]["analysisComplete"])
+        self.assertFalse(result["coverage"]["synthesisComplete"])
+        self.assertTrue(any("synthesis was incomplete" in warning for warning in result["warnings"]))
+
+    def test_run_job_reports_error_when_no_chunk_succeeds(self):
+        job_id = "pipeline-no-chunk-success-test"
+        initial_job = {"state": "queued", "stage": "queued", "completed": 0, "total": 0, "message": "queued"}
+        with (patch.dict(app.JOBS, {job_id: initial_job}),
+              patch("app.analyze_dashboard_chunk", side_effect=UserError("Ollama model is unavailable"))):
+            app.run_job(job_id, "A: One message.", "test-model")
+            result = app.JOBS[job_id]
+
+        self.assertEqual(result["state"], "error")
+        self.assertIn("Ollama model is unavailable", result["message"])
+
     def test_empty_extraction_surfaces_uncertainty(self):
         job_id = "pipeline-empty-test"
         initial_job = {"state": "queued", "stage": "queued", "completed": 0, "total": 0, "message": "queued"}

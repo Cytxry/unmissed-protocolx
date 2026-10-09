@@ -54,6 +54,8 @@ MAX_BODY = 20 * 1024 * 1024
 MAX_TEXT = 12 * 1024 * 1024
 CHUNK_CHARS = 5000
 CHUNK_OVERLAP = 2
+JOB_TTL_SECONDS = 24 * 60 * 60
+MAX_RETAINED_JOBS = 12
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 LOGGER = logging.getLogger("unmissed")
@@ -84,6 +86,30 @@ def validate_local_ollama_url(url: str | None = None) -> None:
 def public_job_data(job: dict) -> dict:
     """Return public job fields without private in-process matching data."""
     return {key: value for key, value in job.items() if not key.startswith("_")}
+
+
+def prune_jobs(now: float | None = None) -> None:
+    """Expire old results and cap retained jobs without removing active QA sources."""
+    current = time.monotonic() if now is None else now
+    with JOBS_LOCK:
+        pinned_sources = {
+            job.get("sourceJobId") for job in JOBS.values()
+            if job.get("state") in {"queued", "running", "done"} and job.get("sourceJobId")
+        }
+        finished = [
+            (float(job.get("_createdAt", current)), job_id)
+            for job_id, job in JOBS.items()
+            if job.get("state") in {"done", "error"} and job_id not in pinned_sources
+        ]
+        for created_at, job_id in finished:
+            if current - created_at > JOB_TTL_SECONDS:
+                JOBS.pop(job_id, None)
+        remaining = sorted(
+            (created_at, job_id) for created_at, job_id in finished if job_id in JOBS
+        )
+        while len(remaining) > MAX_RETAINED_JOBS:
+            _, oldest_id = remaining.pop(0)
+            JOBS.pop(oldest_id, None)
 
 
 def question_needs_user_identity(question: str) -> bool:
@@ -665,16 +691,35 @@ def run_job(job_id: str, raw: str, model: str, user_name: str = "") -> None:
         chunks = make_chunks(messages)
         findings: list[dict] = []
         summaries: list[str] = []
+        failed_chunks: list[int] = []
+        chunk_errors: list[Exception] = []
         for index, chunk in enumerate(chunks, 1):
             with JOBS_LOCK:
                 JOBS[job_id].update({"state": "running", "stage": "inference", "completed": index - 1,
                                      "total": len(chunks), "message": f"Analyzing chunk {index} of {len(chunks)} with {model}…"})
             chunk_started = time.monotonic()
-            result = analyze_dashboard_chunk(model, chunk, user_name)
+            try:
+                result = analyze_dashboard_chunk(model, chunk, user_name)
+            except Exception as exc:
+                failed_chunks.append(index)
+                chunk_errors.append(exc)
+                LOGGER.warning("analysis_chunk_failed chunk=%d total=%d error_type=%s",
+                               index, len(chunks), type(exc).__name__)
+                continue
             LOGGER.info("analysis_chunk_complete chunk=%d total=%d findings=%d elapsed_s=%.2f",
                         index, len(chunks), len(result["findings"]), time.monotonic() - chunk_started)
             summaries.append(result["summary"])
             findings.extend(result["findings"])
+        if not summaries:
+            known_error = next((error for error in chunk_errors if isinstance(error, UserError)), None)
+            if known_error:
+                raise known_error
+            raise UserError("Local analysis failed for every conversation section. Check Ollama and the selected model, then retry.")
+        if failed_chunks:
+            failed_list = ", ".join(str(index) for index in failed_chunks)
+            warnings.append(
+                f"Local analysis failed for section(s) {failed_list}; results cover {len(summaries)} of {len(chunks)} sections and may be incomplete."
+            )
         existing_action_sources = {
             source for finding in findings if finding.get("category") == "action"
             for source in finding.get("evidence", [])
@@ -694,23 +739,38 @@ def run_job(job_id: str, raw: str, model: str, user_name: str = "") -> None:
         findings.extend(item for item in extract_direct_mentions(messages, user_name)
                         if not (set(item["evidence"]) & existing_mention_sources))
         findings = merge_dashboard_findings(findings)
-        if len(chunks) > 1:
+        synthesis_attempted = len(chunks) > 1 and not failed_chunks
+        synthesis_complete = len(chunks) <= 1
+        if len(chunks) > 1 and not failed_chunks:
             with JOBS_LOCK:
                 JOBS[job_id].update({"state": "running", "stage": "summary", "completed": len(chunks),
                                      "total": len(chunks) + 1, "message": "Combining the conversation summary…"})
         try:
-            if len(chunks) > 1:
+            if failed_chunks:
+                # Do not let a final pass infer a complete cross-section story from
+                # missing chunk results. Keep the successful chunk summaries visible.
+                summary = " ".join(dict.fromkeys(item for item in summaries if item))[:900]
+                if not summary:
+                    summary = "Some conversation sections were analyzed, but no concise summary was returned."
+                warnings.append("Cross-section synthesis was skipped because one or more sections failed.")
+            elif len(chunks) > 1:
                 synthesis = synthesize_dashboard(model, summaries, findings, messages, user_name)
                 summary, findings = synthesis["summary"], synthesis["findings"]
+                synthesis_complete = True
                 if synthesis.get("contextTruncated"):
                     warnings.append("The final synthesis source context was shortened for a large transcript; findings remain linked to their original messages, so review sources for cross-section changes.")
             else:
                 summary = summaries[0] if summaries else "No concise summary was available from the local model."
-        except UserError:
+        except Exception as exc:
+            LOGGER.warning("analysis_synthesis_failed error_type=%s", type(exc).__name__)
             summary = " ".join(dict.fromkeys(item for item in summaries if item))[:900]
             warnings.append("Cross-section synthesis was incomplete; findings from every analyzed section are retained, so review the source for conflicts or missing context.")
+            synthesis_complete = False
         if not findings:
-            warnings.append("No clear findings were extracted. This does not confirm there is no important information; review the original messages.")
+            if failed_chunks:
+                warnings.append("No findings were extracted from the successfully analyzed sections; the unanalyzed content is not verified.")
+            else:
+                warnings.append("No clear findings were extracted. This does not confirm there is no important information; review the original messages.")
         for finding in findings:
             finding["priority"] = score_priority(finding, messages)
             for field in ("title", "detail", "owner", "due", "when"):
@@ -724,11 +784,16 @@ def run_job(job_id: str, raw: str, model: str, user_name: str = "") -> None:
             ]
         summary = sanitize_generated_text(summary, user_name)
         warnings = [redact_phone_numbers(warning) for warning in warnings]
+        coverage = {"analysisComplete": not failed_chunks, "analyzedChunks": len(summaries),
+                    "totalChunks": len(chunks), "failedChunks": failed_chunks,
+                    "synthesisComplete": synthesis_complete}
         with JOBS_LOCK:
-            JOBS[job_id].update({"state": "done", "stage": "complete", "completed": len(chunks) + (1 if len(chunks) > 1 else 0),
-                                 "total": len(chunks) + (1 if len(chunks) > 1 else 0), "message": "Catch-up is ready.",
+            completed_steps = len(chunks) + (1 if synthesis_attempted else 0)
+            JOBS[job_id].update({"state": "done", "stage": "complete", "completed": completed_steps,
+                                 "total": completed_steps, "message": "Catch-up is ready.",
                                  "messages": messages, "findings": findings, "summary": summary,
-                                 "model": model, "chunks": len(chunks), "_userName": user_name, "warnings": warnings})
+                                 "model": model, "chunks": len(chunks), "_userName": user_name,
+                                 "warnings": warnings, "coverage": coverage})
     except UserError as exc:
         with JOBS_LOCK:
             JOBS[job_id].update({"state": "error", "stage": "error",
@@ -879,6 +944,7 @@ class Handler(BaseHTTPRequestHandler):
                                       "appName": "Unmissed",
                                       "tagline": "Stop scrolling. Start knowing what matters."})
         if self.path.startswith("/api/jobs/"):
+            prune_jobs()
             job_id = self.path.rsplit("/", 1)[-1]
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
@@ -924,9 +990,10 @@ class Handler(BaseHTTPRequestHandler):
             # Parse before starting so format and size issues are reported immediately.
             parse_transcript_with_warnings(raw)
             job_id = uuid.uuid4().hex
+            prune_jobs()
             with JOBS_LOCK:
                 JOBS[job_id] = {"state": "queued", "stage": "queued", "completed": 0,
-                                "total": 0, "message": "Waiting to start…"}
+                                "total": 0, "message": "Waiting to start…", "_createdAt": time.monotonic()}
             threading.Thread(target=run_job, args=(job_id, raw, model, user_name), daemon=True).start()
             return self.respond(202, {"jobId": job_id})
         except UserError as exc:
@@ -944,13 +1011,15 @@ class Handler(BaseHTTPRequestHandler):
             question = str(data.get("question", "")).strip()
             if not question or len(question) > 1000:
                 return self.respond(400, {"error": "Enter a question between 1 and 1,000 characters."})
+            prune_jobs()
             with JOBS_LOCK:
                 source = JOBS.get(source_job_id)
                 if not source or source.get("state") != "done" or not source.get("messages"):
                     return self.respond(404, {"error": "Conversation not found. Import it again before asking."})
                 question_job_id = uuid.uuid4().hex
                 JOBS[question_job_id] = {"state": "queued", "stage": "queued", "completed": 0,
-                                         "total": 0, "message": "Preparing a grounded answer…", "kind": "answer"}
+                                         "total": 0, "message": "Preparing a grounded answer…", "kind": "answer",
+                                         "sourceJobId": source_job_id, "_createdAt": time.monotonic()}
             threading.Thread(target=run_question, args=(question_job_id, source_job_id, question), daemon=True).start()
             return self.respond(202, {"jobId": question_job_id})
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:

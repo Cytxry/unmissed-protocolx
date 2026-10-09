@@ -7,6 +7,33 @@ from product_logic import redact_phone_numbers
 
 
 class PrivacyTests(unittest.TestCase):
+    def test_job_retention_expires_old_results_and_preserves_active_question_source(self):
+        jobs = {
+            "expired": {"state": "done", "_createdAt": 100.0},
+            "source": {"state": "done", "_createdAt": 100.0},
+            "active-question": {"state": "running", "sourceJobId": "source", "_createdAt": 990.0},
+            "recent": {"state": "done", "_createdAt": 950.0},
+        }
+        with (patch.dict(app.JOBS, jobs, clear=True), patch("app.JOB_TTL_SECONDS", 100)):
+            app.prune_jobs(now=1000.0)
+            remaining = set(app.JOBS)
+
+        self.assertNotIn("expired", remaining)
+        self.assertIn("source", remaining)
+        self.assertIn("active-question", remaining)
+        self.assertIn("recent", remaining)
+
+    def test_job_retention_caps_finished_jobs_without_removing_running_jobs(self):
+        jobs = {f"done-{index}": {"state": "done", "_createdAt": float(index)} for index in range(6)}
+        jobs["running"] = {"state": "running", "_createdAt": 0.0}
+        with (patch.dict(app.JOBS, jobs, clear=True), patch("app.JOB_TTL_SECONDS", 1000),
+              patch("app.MAX_RETAINED_JOBS", 3)):
+            app.prune_jobs(now=10.0)
+            remaining = set(app.JOBS)
+
+        self.assertEqual({job_id for job_id in remaining if job_id.startswith("done-")}, {"done-3", "done-4", "done-5"})
+        self.assertIn("running", remaining)
+
     def test_generated_analysis_is_masked_but_source_message_stays_verbatim(self):
         source = {"id": "m1", "timestamp": "2026-10-09 14:30", "sender": "Maya",
                   "text": "Maya should call +1 (415) 555-0137 about the launch."}
