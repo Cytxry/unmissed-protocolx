@@ -1,8 +1,9 @@
 import unittest
 
 from product_logic import (derive_explicit_actions, extract_direct_mentions, extract_meetings,
-                           merge_dashboard_findings, redact_phone_numbers, sanitize_generated_text,
-                           score_priority)
+                           merge_dashboard_findings, reconcile_explicit_changes,
+                           reconcile_summary_with_explicit_changes, redact_phone_numbers,
+                           sanitize_generated_text, score_priority)
 
 
 class ProductLogicTests(unittest.TestCase):
@@ -12,6 +13,54 @@ class ProductLogicTests(unittest.TestCase):
             {"id": "m2", "timestamp": "10:02", "sender": "Lee", "text": "The venue meeting is Friday."},
             {"id": "m3", "timestamp": "10:03", "sender": "Maya", "text": "Dev, we decided to use the smaller venue."},
         ]
+
+    def test_explicit_later_change_wins_and_stale_finding_shows_both_sources(self):
+        messages = [
+            {"id": "m1", "timestamp": "09:00", "sender": "Maya", "text": "The workshop is booked at North Hall."},
+            {"id": "m2", "timestamp": "09:05", "sender": "Lee", "text": "I shared the attendee notes."},
+            {"id": "m3", "timestamp": "09:10", "sender": "Dev", "text": "Important change: the venue moved from North Hall to East Hall."},
+        ]
+        stale = {"category": "other_update", "title": "Venue stays at North Hall",
+                 "detail": "The venue remains at North Hall.", "confidence": "high",
+                 "evidence": ["m1"], "conflictEvidence": [], "owner": "", "due": "", "when": ""}
+
+        findings = reconcile_explicit_changes([stale], messages)
+        latest = next(item for item in findings if item["evidence"] == ["m3"])
+        earlier = next(item for item in findings if "North Hall" in item["title"])
+        summary = reconcile_summary_with_explicit_changes(
+            "No significant changes or updates were made in the conversation.", messages)
+
+        self.assertEqual(latest["category"], "other_update")
+        self.assertIn("North Hall", latest["title"])
+        self.assertIn("East Hall", latest["title"])
+        self.assertEqual(latest["conflictEvidence"], ["m1"])
+        self.assertEqual(earlier["conflictEvidence"], ["m3"])
+        self.assertTrue(earlier["conflict"])
+        self.assertEqual(earlier["confidence"], "low")
+        self.assertIn("East Hall", summary)
+        self.assertNotIn("No significant changes", summary)
+
+    def test_explicit_change_summary_uses_latest_supported_destination(self):
+        messages = [
+            {"id": "m1", "timestamp": "09:00", "sender": "A", "text": "Room changed from North Hall to East Hall."},
+            {"id": "m2", "timestamp": "09:05", "sender": "B", "text": "Room moved from East Hall to West Hall."},
+        ]
+        summary = reconcile_summary_with_explicit_changes("The venue is now East Hall.", messages)
+        self.assertIn("West Hall", summary)
+        self.assertNotIn("now East Hall", summary)
+
+    def test_change_hidden_in_action_category_is_also_kept_as_other_update(self):
+        messages = [
+            {"id": "m1", "timestamp": "09:00", "sender": "A", "text": "We booked North Hall."},
+            {"id": "m2", "timestamp": "09:05", "sender": "B", "text": "The venue moved from North Hall to East Hall."},
+        ]
+        action = {"category": "action", "title": "Venue moved to East Hall", "detail": "The venue moved from North Hall to East Hall.",
+                  "confidence": "high", "evidence": ["m2"], "conflictEvidence": [], "owner": "", "due": "", "when": ""}
+        findings = reconcile_explicit_changes([action], messages)
+        update = next(item for item in findings if item["category"] == "other_update")
+        self.assertIn("East Hall", update["title"])
+        self.assertEqual(update["evidence"], ["m2"])
+        self.assertIn("m1", update["conflictEvidence"])
 
     def test_priority_is_deterministic_and_explained(self):
         finding = {"category": "action", "owner": "Dev", "due": "tomorrow", "evidence": ["m1"]}

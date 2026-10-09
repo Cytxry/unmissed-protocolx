@@ -253,6 +253,34 @@ class AnalysisPipelineTests(unittest.TestCase):
         self.assertEqual(result["state"], "error")
         self.assertIn("Ollama model is unavailable", result["message"])
 
+    def test_run_job_reconciles_explicit_location_change_after_inaccurate_synthesis(self):
+        raw = "\n".join([
+            "Maya: The workshop is booked at North Hall.",
+            "Lee: Attendee notes are ready for Friday.",
+            "Dev: Important change: the venue moved from North Hall to East Hall.",
+        ])
+        stale = {"category": "other_update", "title": "Venue stays at North Hall",
+                 "detail": "The venue remains at North Hall.", "confidence": "high",
+                 "evidence": ["m1"], "conflictEvidence": [], "owner": "", "due": "", "when": ""}
+        job_id = "pipeline-location-change-test"
+        initial_job = {"state": "queued", "stage": "queued", "completed": 0, "total": 0, "message": "queued"}
+        with (patch.dict(app.JOBS, {job_id: initial_job}),
+              patch("app.CHUNK_CHARS", 180),
+              patch("app.analyze_dashboard_chunk", return_value={"summary": "Section checked.", "findings": []}),
+              patch("app.synthesize_dashboard", return_value={"summary": "No significant changes were made.", "findings": [stale]})):
+            app.run_job(job_id, raw, "test-model")
+            result = app.JOBS[job_id]
+
+        self.assertEqual(result["state"], "done")
+        self.assertIn("East Hall", result["summary"])
+        self.assertNotIn("No significant changes", result["summary"])
+        latest = next(item for item in result["findings"] if "East Hall" in item["title"])
+        old = next(item for item in result["findings"] if "North Hall" in item["title"] and "East Hall" not in item["title"])
+        self.assertIn("m3", latest["evidence"])
+        self.assertIn("m1", latest["conflictEvidence"])
+        self.assertIn("m3", old["conflictEvidence"])
+        self.assertTrue(old["conflict"])
+
     def test_empty_extraction_surfaces_uncertainty(self):
         job_id = "pipeline-empty-test"
         initial_job = {"state": "queued", "stage": "queued", "completed": 0, "total": 0, "message": "queued"}

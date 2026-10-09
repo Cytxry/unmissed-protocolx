@@ -42,6 +42,8 @@ from product_logic import (
     extract_meetings,
     merge_dashboard_findings,
     redact_phone_numbers,
+    reconcile_explicit_changes,
+    reconcile_summary_with_explicit_changes,
     sanitize_generated_text,
     score_priority,
 )
@@ -766,6 +768,8 @@ def run_job(job_id: str, raw: str, model: str, user_name: str = "") -> None:
             summary = " ".join(dict.fromkeys(item for item in summaries if item))[:900]
             warnings.append("Cross-section synthesis was incomplete; findings from every analyzed section are retained, so review the source for conflicts or missing context.")
             synthesis_complete = False
+        findings = reconcile_explicit_changes(findings, messages)
+        summary = reconcile_summary_with_explicit_changes(summary, messages)
         if not findings:
             if failed_chunks:
                 warnings.append("No findings were extracted from the successfully analyzed sections; the unanalyzed content is not verified.")

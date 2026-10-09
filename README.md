@@ -32,7 +32,7 @@ The application uses only the Python standard library. The browser UI is plain H
 - Custom and suggested questions search every conversation chunk with the local model, then reconcile grounded answers and source IDs when the transcript spans multiple chunks.
 - Select a finding or citation to jump to its original message. Original message text is retained in the current app process for evidence and is masked only when displayed; generated text and phone numbers in logs are redacted.
 
-An unfamiliar finding category is retained as an “Other update.” If any analysis section or final synthesis fails, the app preserves successful findings and reports the incomplete coverage in the result. An empty finding list is accompanied by an uncertainty notice.
+An unfamiliar finding category is retained as an “Other update.” Explicit “changed/moved from X to Y” statements are reconciled against earlier cited messages so a stale state is flagged and the later state remains visible. Other paraphrased changes still depend on model interpretation. If any analysis section or final synthesis fails, the app preserves successful findings and reports the incomplete coverage in the result. An empty finding list is accompanied by an uncertainty notice.
 
 ## Local processing and privacy
 

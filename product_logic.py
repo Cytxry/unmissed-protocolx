@@ -215,3 +215,90 @@ def merge_dashboard_findings(findings: list[dict]) -> list[dict]:
             item["confidence"] = "low"
             item["conflictNote"] = "The model found messages that may contradict this decision; review both sources."
     return merged
+
+
+EXPLICIT_CHANGE_PATTERN = re.compile(
+    r"\b(?:changed|moved|switched|relocated|rescheduled|shifted)\b.{0,100}?\bfrom\s+([^,.;!?\n]{1,80}?)\s+to\s+([^,.;!?\n]{1,80})",
+    re.IGNORECASE,
+)
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    return bool(re.search(rf"(?<!\w){re.escape(phrase.strip())}(?!\w)", text, re.IGNORECASE))
+
+
+def _explicit_changes(messages: list[dict]) -> list[dict]:
+    changes = []
+    for position, message in enumerate(messages):
+        match = EXPLICIT_CHANGE_PATTERN.search(message.get("text", ""))
+        if not match:
+            continue
+        before, after = (part.strip(" \t\"'“”‘’") for part in match.groups())
+        if not before or not after or before.casefold() == after.casefold():
+            continue
+        prior_ids = [
+            previous["id"] for previous in messages[:position]
+            if _contains_phrase(previous.get("text", ""), before)
+        ]
+        changes.append({"message": message, "position": position, "before": before,
+                        "after": after, "priorIds": prior_ids})
+    return changes
+
+
+def reconcile_explicit_changes(findings: list[dict], messages: list[dict]) -> list[dict]:
+    """Retain explicit later states and mark cited earlier states as superseded."""
+    positions = {message["id"]: index for index, message in enumerate(messages)}
+    by_id = {message["id"]: message for message in messages}
+    reconciled = [
+        {**finding, "evidence": list(finding.get("evidence", [])),
+         "conflictEvidence": list(finding.get("conflictEvidence", []))}
+        for finding in findings
+    ]
+    for change in _explicit_changes(messages):
+        before, after = change["before"], change["after"]
+        change_id = change["message"]["id"]
+        represented = False
+        for finding in reconciled:
+            finding_text = f"{finding.get('title', '')} {finding.get('detail', '')}"
+            cited_before = [
+                source for source in finding.get("evidence", [])
+                if source in positions and positions[source] < change["position"]
+                and _contains_phrase(by_id[source].get("text", ""), before)
+            ]
+            if cited_before and _contains_phrase(finding_text, before) and not _contains_phrase(finding_text, after):
+                finding["conflictEvidence"] = list(dict.fromkeys(finding["conflictEvidence"] + [change_id]))
+            if change_id in finding.get("evidence", []) and _contains_phrase(finding_text, after):
+                finding["conflictEvidence"] = list(dict.fromkeys(
+                    finding["conflictEvidence"] + change["priorIds"]
+                ))
+                if finding.get("category") in {"other_update", "decision", "meeting"}:
+                    represented = True
+        if not represented:
+            reconciled.append({
+                "category": "other_update",
+                "title": f"Explicit change from {before} to {after}",
+                "detail": f"A later message explicitly changes this from {before} to {after}.",
+                "owner": "", "due": "", "when": "", "confidence": "high",
+                "evidence": [change_id], "conflictEvidence": change["priorIds"],
+            })
+    return merge_dashboard_findings(reconciled)
+
+
+def reconcile_summary_with_explicit_changes(summary: str, messages: list[dict]) -> str:
+    """Prevent a no-change or stale summary from contradicting an explicit later update."""
+    changes = _explicit_changes(messages)
+    if not changes:
+        return summary
+    latest = changes[-1]
+    before, after = latest["before"], latest["after"]
+    no_change_claim = re.compile(r"\bno\b.{0,60}\b(?:changes?|updates?|moves?|cancellations?)\b", re.IGNORECASE)
+    sentences = re.split(r"(?<=[.!?])\s+", summary.strip())
+    retained = [
+        sentence for sentence in sentences
+        if sentence and not no_change_claim.search(sentence)
+        and not (_contains_phrase(sentence, before) and not _contains_phrase(sentence, after))
+    ]
+    if _contains_phrase(summary, after) and not no_change_claim.search(summary):
+        return summary
+    update = f"Explicit update: the conversation changes from {before} to {after}."
+    return " ".join([update, *retained]).strip()[:900]
